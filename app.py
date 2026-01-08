@@ -70,12 +70,6 @@ def windows_for_mode():
     return [(time(9, 0), time(18, 0))]
 
 def minutes_in_windows(day: date, s: datetime, e: datetime, windows):
-    """
-    (day, s~e) 구간을 지정된 windows로 클리핑해서 총 분 반환
-    - 09 이전 시작 -> 09로 처리
-    - 18 이후 종료 -> 18로 처리
-    (windows 자체가 그 역할)
-    """
     total = 0.0
     for ws_t, we_t in windows:
         ws = datetime.combine(day, ws_t)
@@ -87,11 +81,6 @@ def minutes_in_windows(day: date, s: datetime, e: datetime, windows):
     return total
 
 def explode_reservation_to_daily_minutes(room: str, s: datetime, e: datetime, holiday_set: set[date], windows):
-    """
-    예약이 여러 날에 걸쳐도 날짜별로 분해:
-    - 주말/공휴일 제외
-    - windows에 해당하는 시간만 계산
-    """
     out = []
     cur_day = s.date()
     last_day = e.date()
@@ -109,7 +98,7 @@ def explode_reservation_to_daily_minutes(room: str, s: datetime, e: datetime, ho
 
         mins = minutes_in_windows(cur_day, seg_s, seg_e, windows)
         if mins > 0:
-            out.append({"회의실": room, "일자": cur_day, "예약시간(분)": mins})
+            out.append({"room": room, "day": cur_day, "reserved_min": mins})
 
         cur_day += timedelta(days=1)
 
@@ -117,19 +106,18 @@ def explode_reservation_to_daily_minutes(room: str, s: datetime, e: datetime, ho
 
 def clean_room_name(x: str) -> str:
     x = str(x)
-    # 끝 괄호 제거: "A(본관)" -> "A"
-    x = re.sub(r"\s*\(.*\)\s*$", "", x)
+    x = re.sub(r"\s*\(.*\)\s*$", "", x)  # 끝 괄호 제거
     return x.strip()
 
 def make_auto_commentary(usage: pd.DataFrame, selected_month: str) -> str:
     if usage.empty:
         return "표시할 데이터가 없어요."
 
-    avg = float(usage["예약률(%)"].mean())
-    top3 = usage.head(3)[["회의실", "예약률(%)"]].values.tolist()
-    bottom3 = usage.tail(3)[["회의실", "예약률(%)"]].values.tolist()
+    avg = float(usage["rate"].mean())
+    top3 = usage.head(3)[["room", "rate"]].values.tolist()
+    bottom3 = usage.tail(3)[["room", "rate"]].values.tolist()
 
-    low = usage[usage["예약률(%)"] < 10][["회의실", "예약률(%)"]]
+    low = usage[usage["rate"] < 10][["room", "rate"]]
     low_line = ""
     if len(low) > 0:
         low_list = ", ".join([f"{r}({p:.1f}%)" for r, p in low.values[:8]])
@@ -175,18 +163,15 @@ if missing:
     st.error(f"필수 컬럼을 못 찾았어: {missing}\n(현재는 회의실/시작/중료(or 종료) 필요)")
     st.stop()
 
-# datetime 파싱
 df = df.copy()
 df[start_col] = pd.to_datetime(df[start_col], errors="coerce")
 df[end_col] = pd.to_datetime(df[end_col], errors="coerce")
 df = df[df[start_col].notna() & df[end_col].notna()].copy()
 df = df[df[end_col] > df[start_col]].copy()
 
-# 회의실명 정리
-df["회의실_clean"] = df[room_col].apply(clean_room_name)
-
-# 월 선택
+df["room"] = df[room_col].apply(clean_room_name)
 df["month"] = df[start_col].dt.to_period("M").astype(str)
+
 months = sorted(df["month"].unique())
 if not months:
     st.error("월 정보를 만들 수 없어요. '시작' 컬럼이 날짜/시간 형식인지 확인해줘.")
@@ -201,7 +186,6 @@ years = sorted({month_start.year, (month_end - timedelta(days=1)).year})
 holiday_set = build_holiday_set(years)
 windows = windows_for_mode()
 
-# 로딩 연출
 if show_loading:
     ph = st.empty()
     prog = st.progress(0)
@@ -218,48 +202,41 @@ month_s = month_start.to_pydatetime()
 month_e = month_end.to_pydatetime()
 df_m = df[(df[end_col] > month_s) & (df[start_col] < month_e)].copy()
 
-# 날짜별 예약 분해(=시간대 클리핑 포함)
+# 일자별 분해
 rows = []
 for _, r in df_m.iterrows():
-    room = r["회의실_clean"]
     s = max(r[start_col].to_pydatetime(), month_s)
     e = min(r[end_col].to_pydatetime(), month_e)
-    rows.extend(explode_reservation_to_daily_minutes(room, s, e, holiday_set, windows))
+    rows.extend(explode_reservation_to_daily_minutes(r["room"], s, e, holiday_set, windows))
 
 daily = pd.DataFrame(rows)
 if daily.empty:
     st.warning("선택한 월에 계산 가능한 예약이 없어요(근무일/시간대 기준).")
     st.stop()
 
-# 월간 회의실별 예약시간
-usage = daily.groupby("회의실", as_index=False)["예약시간(분)"].sum()
-usage["예약시간(시간)"] = usage["예약시간(분)"] / 60
+# 월간 집계
+usage = daily.groupby("room", as_index=False)["reserved_min"].sum()
+usage["reserved_h"] = usage["reserved_min"] / 60
 
-# 가용시간 = 근무일수 * (windows 합산 시간)
 days = pd.date_range(month_start, month_end - pd.Timedelta(days=1), freq="D")
 workdays = [ts.date() for ts in days if is_workday(ts.date(), holiday_set)]
 workday_count = len(workdays)
 
-available_minutes_per_room = workday_count * window_minutes_per_day(windows)
+avail_min_per_room = workday_count * window_minutes_per_day(windows)
+usage["avail_h"] = avail_min_per_room / 60
+usage["rate"] = (usage["reserved_min"] / avail_min_per_room) * 100
+usage["rate"] = usage["rate"].clip(lower=0)
 
-usage["가용시간(시간)"] = available_minutes_per_room / 60
-usage["예약률(%)"] = (usage["예약시간(분)"] / available_minutes_per_room) * 100
-
-# 0% 미만 방지
-usage["예약률(%)"] = usage["예약률(%)"].clip(lower=0)
-
-usage = usage.sort_values("예약률(%)", ascending=False).reset_index(drop=True)
+usage = usage.sort_values("rate", ascending=False).reset_index(drop=True)
 
 # -----------------------------
 # Dashboard
 # -----------------------------
 st.subheader("2) 대시보드")
 
-# KPI
-top_room = usage.iloc[0]["회의실"]
-top_rate = float(usage.iloc[0]["예약률(%)"])
-avg_rate = float(usage["예약률(%)"].mean())
-total_rooms = int(usage["회의실"].nunique())
+top_room = usage.iloc[0]["room"]
+top_rate = float(usage.iloc[0]["rate"])
+total_rooms = int(usage["room"].nunique())
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("대상 월", selected_month)
@@ -267,63 +244,61 @@ c2.metric("근무일 수", f"{workday_count}일")
 c3.metric("회의실 수", f"{total_rooms}개")
 c4.metric("최고 예약률", f"{top_rate:.1f}%", help=f"{top_room}")
 
-# 자동 코멘트
 with st.container(border=True):
     st.markdown(make_auto_commentary(usage, selected_month))
 
-# 파스텔 색상 매핑(회의실별)
+# ---- 차트(여기서 막대 안 나오던 문제 해결: 안전한 컬럼명 사용) ----
 chart_df = usage.copy()
-chart_df["예약률(%)"] = chart_df["예약률(%)"].round(1)
+chart_df["rate"] = pd.to_numeric(chart_df["rate"], errors="coerce").fillna(0.0)
+chart_df["reserved_h"] = pd.to_numeric(chart_df["reserved_h"], errors="coerce").fillna(0.0)
+chart_df["avail_h"] = pd.to_numeric(chart_df["avail_h"], errors="coerce").fillna(0.0)
 
-rooms = chart_df["회의실"].tolist()
+rooms = chart_df["room"].tolist()
 color_map = {r: PASTEL[i % len(PASTEL)] for i, r in enumerate(rooms)}
 color_scale = alt.Scale(domain=list(color_map.keys()), range=list(color_map.values()))
 
-# 회의실명 X축, 예약률 Y축 (세로 막대)
+y_max = float(chart_df["rate"].max()) if len(chart_df) else 0.0
+y_domain_max = max(5.0, y_max * 1.15)
+
 bar = alt.Chart(chart_df).mark_bar(cornerRadius=6).encode(
     x=alt.X(
-        "회의실:N",
+        "room:N",
         sort="-y",
         title="회의실",
-        axis=alt.Axis(
-            labelAngle=-30,
-            labelFontSize=12,
-            labelLimit=220
-        )
+        axis=alt.Axis(labelAngle=-30, labelFontSize=12, labelLimit=220)
     ),
     y=alt.Y(
-        "예약률_plot:Q",
+        "rate:Q",
         title="예약률(%)",
-        scale=alt.Scale(domain=[0, max(5, float(chart_df["예약률(%)"].max()) * 1.15)])
+        scale=alt.Scale(domain=[0, y_domain_max])
     ),
-    color=alt.Color("회의실:N", scale=color_scale, legend=None),
+    color=alt.Color("room:N", scale=color_scale, legend=None),
     tooltip=[
-        alt.Tooltip("회의실:N", title="회의실"),
-        alt.Tooltip("예약률(%):Q", title="예약률(%)", format=".1f"),
-        alt.Tooltip("예약시간(시간):Q", title="예약시간(시간)", format=".1f"),
-        alt.Tooltip("가용시간(시간):Q", title="가용시간(시간)", format=".1f"),
+        alt.Tooltip("room:N", title="회의실"),
+        alt.Tooltip("rate:Q", title="예약률(%)", format=".1f"),
+        alt.Tooltip("reserved_h:Q", title="예약시간(시간)", format=".1f"),
+        alt.Tooltip("avail_h:Q", title="가용시간(시간)", format=".1f"),
     ],
-).transform_calculate(
-    **{
-        "예약률_plot": "datum['예약률(%)']",
-        "예약률(%)": "datum['예약률(%)']",
-        "예약률(%)_alias": "datum['예약률(%)']"
-    }
 )
 
-# 막대 위 숫자 라벨
 text = alt.Chart(chart_df).mark_text(dy=-8, fontSize=11).encode(
-    x=alt.X("회의실:N", sort="-y"),
-    y=alt.Y("예약률_plot:Q"),
-    text=alt.Text("예약률_plot:Q", format=".1f")
+    x=alt.X("room:N", sort="-y"),
+    y=alt.Y("rate:Q"),
+    text=alt.Text("rate:Q", format=".1f")
 )
 
 st.altair_chart((bar + text).properties(height=420).interactive(), use_container_width=True)
 
 # 테이블
 st.markdown("### 📋 회의실별 예약률 테이블")
+table_df = usage.rename(columns={
+    "room": "회의실",
+    "reserved_h": "예약시간(시간)",
+    "avail_h": "가용시간(시간)",
+    "rate": "예약률(%)"
+})
 st.dataframe(
-    usage[["회의실", "예약시간(시간)", "가용시간(시간)", "예약률(%)"]]
+    table_df[["회의실", "예약시간(시간)", "가용시간(시간)", "예약률(%)"]]
     .round({"예약시간(시간)": 1, "가용시간(시간)": 1, "예약률(%)": 1}),
     use_container_width=True
 )
