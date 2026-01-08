@@ -1,15 +1,14 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import altair as alt
 from datetime import datetime, time, timedelta, date
 import re
 
-import holidays  # requirements.txt에 포함
+import holidays
+import plotly.express as px
 
 st.set_page_config(page_title="회의실 예약률 대시보드", layout="wide")
 st.title("🏢 회의실별 월간 예약률 대시보드")
-st.caption("엑셀 업로드 → 월 선택 → (주말/공휴일 제외) + 시간대 클리핑 → 회의실별 예약률")
+st.caption("엑셀 업로드 → 월 선택 → 주말/공휴일 제외 + 시간대(전체/주요업무) 기준 예약률")
 
 uploaded = st.file_uploader("📂 예약현황 Raw 엑셀 업로드 (.xlsx)", type=["xlsx"])
 
@@ -29,8 +28,11 @@ with st.sidebar:
     exclude_holidays = st.checkbox("공휴일 제외(대한민국)", value=True)
 
     st.divider()
-    st.subheader("대시보드 연출")
-    show_loading = st.checkbox("계산 로딩 연출", value=True)
+    show_loading = st.checkbox("계산 로딩 연출", value=False)
+
+    st.divider()
+    st.subheader("표시 옵션")
+    cap_at_100 = st.checkbox("그래프는 0~100%로 표시(100% 초과는 100으로 표시)", value=True)
 
 PASTEL = [
     "#AEC6CF", "#FFB347", "#B39EB5", "#77DD77", "#FF6961",
@@ -63,13 +65,15 @@ def is_workday(d: date, holiday_set: set[date]) -> bool:
     return True
 
 def windows_for_mode():
-    # 주요업무시간 = 09~11, 14~17
     if time_mode.startswith("주요업무시간"):
         return [(time(9, 0), time(11, 0)), (time(14, 0), time(17, 0))]
-    # 전체업무시간 = 09~18
     return [(time(9, 0), time(18, 0))]
 
 def minutes_in_windows(day: date, s: datetime, e: datetime, windows):
+    """
+    요청사항 클리핑 포함:
+    - windows 내에서만 계산되므로 09 이전 시작은 09로, 18 이후 종료는 18로 자동 클리핑됨
+    """
     total = 0.0
     for ws_t, we_t in windows:
         ws = datetime.combine(day, ws_t)
@@ -109,6 +113,13 @@ def clean_room_name(x: str) -> str:
     x = re.sub(r"\s*\(.*\)\s*$", "", x)  # 끝 괄호 제거
     return x.strip()
 
+def window_minutes_per_day(windows):
+    dummy = datetime(2000, 1, 1)
+    mins = 0.0
+    for ws_t, we_t in windows:
+        mins += (datetime.combine(dummy.date(), we_t) - datetime.combine(dummy.date(), ws_t)).total_seconds() / 60
+    return mins
+
 def make_auto_commentary(usage: pd.DataFrame, selected_month: str) -> str:
     if usage.empty:
         return "표시할 데이터가 없어요."
@@ -116,6 +127,11 @@ def make_auto_commentary(usage: pd.DataFrame, selected_month: str) -> str:
     avg = float(usage["rate"].mean())
     top3 = usage.head(3)[["room", "rate"]].values.tolist()
     bottom3 = usage.tail(3)[["room", "rate"]].values.tolist()
+
+    over100 = usage[usage["rate"] > 100]
+    over_line = ""
+    if len(over100) > 0:
+        over_line = f"- **주의(100% 초과)**: {len(over100)}개 회의실 (중복예약/겹침 예약이 있으면 100% 초과 가능)"
 
     low = usage[usage["rate"] < 10][["room", "rate"]]
     low_line = ""
@@ -134,15 +150,10 @@ def make_auto_commentary(usage: pd.DataFrame, selected_month: str) -> str:
     ]
     if low_line:
         lines.append(low_line)
+    if over_line:
+        lines.append(over_line)
     lines.append(f"- **한 줄 코멘트**: 이번 달은 **{busiest_room}** 예약률이 가장 높아요(**{busiest_rate:.1f}%**).")
     return "\n".join(lines)
-
-def window_minutes_per_day(windows):
-    dummy = datetime(2000, 1, 1)
-    mins = 0.0
-    for ws_t, we_t in windows:
-        mins += (datetime.combine(dummy.date(), we_t) - datetime.combine(dummy.date(), ws_t)).total_seconds() / 60
-    return mins
 
 # -----------------------------
 # Main
@@ -202,7 +213,6 @@ month_s = month_start.to_pydatetime()
 month_e = month_end.to_pydatetime()
 df_m = df[(df[end_col] > month_s) & (df[start_col] < month_e)].copy()
 
-# 일자별 분해
 rows = []
 for _, r in df_m.iterrows():
     s = max(r[start_col].to_pydatetime(), month_s)
@@ -247,47 +257,35 @@ c4.metric("최고 예약률", f"{top_rate:.1f}%", help=f"{top_room}")
 with st.container(border=True):
     st.markdown(make_auto_commentary(usage, selected_month))
 
-# ---- 차트(여기서 막대 안 나오던 문제 해결: 안전한 컬럼명 사용) ----
+# ---- Plotly 가로 막대(회의실명 왼쪽) + 파스텔 ----
 chart_df = usage.copy()
-chart_df["rate"] = pd.to_numeric(chart_df["rate"], errors="coerce").fillna(0.0)
-chart_df["reserved_h"] = pd.to_numeric(chart_df["reserved_h"], errors="coerce").fillna(0.0)
-chart_df["avail_h"] = pd.to_numeric(chart_df["avail_h"], errors="coerce").fillna(0.0)
+chart_df["rate_show"] = chart_df["rate"].clip(upper=100) if cap_at_100 else chart_df["rate"]
 
-rooms = chart_df["room"].tolist()
-color_map = {r: PASTEL[i % len(PASTEL)] for i, r in enumerate(rooms)}
-color_scale = alt.Scale(domain=list(color_map.keys()), range=list(color_map.values()))
+# 색상 매핑(회의실별)
+palette = (PASTEL * ((len(chart_df) // len(PASTEL)) + 1))[:len(chart_df)]
+color_map = dict(zip(chart_df["room"], palette))
 
-y_max = float(chart_df["rate"].max()) if len(chart_df) else 0.0
-y_domain_max = max(5.0, y_max * 1.15)
-
-bar = alt.Chart(chart_df).mark_bar(cornerRadius=6).encode(
-    x=alt.X(
-        "room:N",
-        sort="-y",
-        title="회의실",
-        axis=alt.Axis(labelAngle=-30, labelFontSize=12, labelLimit=220)
-    ),
-    y=alt.Y(
-        "rate:Q",
-        title="예약률(%)",
-        scale=alt.Scale(domain=[0, y_domain_max])
-    ),
-    color=alt.Color("room:N", scale=color_scale, legend=None),
-    tooltip=[
-        alt.Tooltip("room:N", title="회의실"),
-        alt.Tooltip("rate:Q", title="예약률(%)", format=".1f"),
-        alt.Tooltip("reserved_h:Q", title="예약시간(시간)", format=".1f"),
-        alt.Tooltip("avail_h:Q", title="가용시간(시간)", format=".1f"),
-    ],
+fig = px.bar(
+    chart_df,
+    x="rate_show",
+    y="room",
+    orientation="h",
+    text=chart_df["rate"].round(1),   # 실제 값(100 초과도 표시)
+    color="room",
+    color_discrete_map=color_map,
+    labels={"rate_show": "예약률(%)", "room": "회의실"},
 )
 
-text = alt.Chart(chart_df).mark_text(dy=-8, fontSize=11).encode(
-    x=alt.X("room:N", sort="-y"),
-    y=alt.Y("rate:Q"),
-    text=alt.Text("rate:Q", format=".1f")
+fig.update_traces(textposition="outside", cliponaxis=False)
+fig.update_layout(
+    showlegend=False,
+    xaxis=dict(range=[0, 105] if cap_at_100 else [0, max(105, float(chart_df["rate"].max()) * 1.1)]),
+    yaxis=dict(autorange="reversed"),  # 높은 예약률이 위로
+    margin=dict(l=10, r=30, t=10, b=10),
+    height=min(900, 30 * len(chart_df) + 120),
 )
 
-st.altair_chart((bar + text).properties(height=420).interactive(), use_container_width=True)
+st.plotly_chart(fig, use_container_width=True)
 
 # 테이블
 st.markdown("### 📋 회의실별 예약률 테이블")
