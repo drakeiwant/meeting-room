@@ -121,7 +121,7 @@ def explode_reservation_to_daily_minutes(room: str, s: datetime, e: datetime, ho
 
 def clean_room_name(x: str) -> str:
     x = str(x)
-    x = re.sub(r"\s*\(.*\)\s*$", "", x)
+    x = re.sub(r"\s*\(.*\)\s*$", "", x)  # 끝 괄호 제거
     return x.strip()
 
 def classify(avg_rate: float) -> str:
@@ -154,6 +154,7 @@ if not uploaded:
 
 df = pd.read_excel(uploaded)
 
+# 컬럼명 (오타 '중료' 지원)
 room_col = "회의실"
 start_col = "시작"
 end_col = "중료" if "중료" in df.columns else ("종료" if "종료" in df.columns else None)
@@ -182,13 +183,13 @@ selected = st.selectbox("월 또는 전체", month_options, index=0)
 
 windows = windows_for_mode()
 
-# holiday years
+# 공휴일 연도 범위(업로드 기간)
 min_day = df[start_col].min().date()
 max_day = df[end_col].max().date()
-years = tuple(range(min_day.year, max_day.year + 1))
-holiday_set = build_holiday_set(list(years))
+years = list(range(min_day.year, max_day.year + 1))
+holiday_set = build_holiday_set(years)
 
-# explode → daily → monthly
+# explode → daily
 rows = []
 for _, r in df.iterrows():
     s = r[start_col].to_pydatetime()
@@ -205,25 +206,29 @@ daily["month"] = pd.to_datetime(daily["day"]).dt.to_period("M").astype(str)
 all_months = sorted(daily["month"].unique())
 rooms_all = sorted(daily["room"].unique())
 
+# 월별 가용시간
 avail_map = {m: available_minutes_for_month(m, holiday_set, windows) for m in all_months}
 
+# 월별 rate
 monthly = daily.groupby(["month", "room"], as_index=False)["reserved_min"].sum()
 monthly["avail_min"] = monthly["month"].map(avail_map)
 monthly["rate"] = (monthly["reserved_min"] / monthly["avail_min"]) * 100
 monthly["rate"] = monthly["rate"].clip(lower=0)
 
-# -------- 전체 평균을 위해: 0인 달 제외 평균 --------
-# 즉: monthly에 존재하는 month-room만 대상으로 평균 (rate>0만)
+# 0인 달 제외 평균(= rate > 0)
 monthly_nonzero = monthly[monthly["rate"] > 0].copy()
 
+# -----------------------------
+# Build cur_table / mom / trend scope
+# -----------------------------
 if selected == "전체(업로드 기간)":
     scope_title = f"전체(업로드 기간) · {all_months[0]} ~ {all_months[-1]}"
 
-    # ✅ 핵심: 0인 달 제외 평균
-    agg = (monthly_nonzero.groupby("room", as_index=False)["rate"].mean()
+    # ✅ 핵심: 0인 달(rate==0) 제외 평균
+    agg = (monthly_nonzero.groupby("room", as_index=False)["rate"]
+           .mean()
            .rename(columns={"rate": "avg_rate"}))
 
-    # 어떤 회의실은 전 기간 0이라 monthly_nonzero에 아예 없을 수 있음 → 표시용으로 0으로 붙임
     base_rooms = pd.DataFrame({"room": rooms_all})
     agg = base_rooms.merge(agg, on="room", how="left")
     agg["avg_rate"] = agg["avg_rate"].fillna(0.0)
@@ -232,7 +237,6 @@ if selected == "전체(업로드 기간)":
     agg["판단"] = agg["avg_rate"].apply(classify)
 
     cur_table = agg.sort_values("rate", ascending=False).reset_index(drop=True)
-
     trend_months = all_months
 
     # 전월 대비: 마지막월 vs 전월 (없는 room은 0)
@@ -251,14 +255,14 @@ if selected == "전체(업로드 기간)":
 else:
     scope_title = selected
 
-    # 선택월 테이블(없는 room은 0)
+    # 선택월 rate(없는 room은 0으로 표시용)
     cur = pd.DataFrame({"room": rooms_all}).merge(
         monthly[monthly["month"] == selected][["room", "rate"]],
         on="room", how="left"
     )
     cur["rate"] = cur["rate"].fillna(0.0)
 
-    # 최근 3개월 평균도 "0 제외"로 (원하면 여긴 0 포함도 가능)
+    # 최근 3개월 평균도 "0 제외" 평균
     sel_ts = pd.to_datetime(selected + "-01")
     last3 = [
         (sel_ts - pd.DateOffset(months=2)).strftime("%Y-%m"),
@@ -271,16 +275,17 @@ else:
             .groupby("room", as_index=False)["rate"]
             .mean()
             .rename(columns={"rate": "avg_rate"}))
+
     cur2 = cur.merge(avg3, on="room", how="left")
     cur2["avg_rate"] = cur2["avg_rate"].fillna(0.0)
-
     cur2["판단"] = cur2["avg_rate"].apply(classify)
+
     cur_table = cur2.sort_values("rate", ascending=False).reset_index(drop=True)
 
-    # 전월 대비(없는 room 0)
+    # 전월 대비
     prev_m = (sel_ts - pd.DateOffset(months=1)).strftime("%Y-%m")
-    prev_df = monthly[monthly["month"] == prev_m][["room", "rate"]].rename(columns={"rate": "prev_rate"}) if prev_m in all_months else None
     cur_df = monthly[monthly["month"] == selected][["room", "rate"]].rename(columns={"rate": "cur_rate"})
+    prev_df = monthly[monthly["month"] == prev_m][["room", "rate"]].rename(columns={"rate": "prev_rate"}) if prev_m in all_months else None
 
     mom = pd.DataFrame({"room": rooms_all}).merge(cur_df, on="room", how="left")
     mom["cur_rate"] = mom["cur_rate"].fillna(0.0)
@@ -360,6 +365,7 @@ fig = px.bar(
     labels={"rate_show": "예약률(%)", "room": "회의실"},
 )
 fig.update_traces(textposition="outside", cliponaxis=False)
+
 x_max = 105 if cap_at_100 else max(105, float(chart_df["rate"].max()) * 1.1)
 fig.update_layout(
     showlegend=False,
@@ -371,13 +377,15 @@ fig.update_layout(
 st.plotly_chart(fig, use_container_width=True)
 
 # -----------------------------
-# Trend chart (추이는 0도 표시하는 게 직관적이라 그대로)
+# Trend chart (추이는 0도 표시)
 # -----------------------------
 st.markdown("### 📈 예약률 추이")
 
-trend = pd.DataFrame({"month": all_months}).merge(pd.DataFrame({"room": rooms_all}), how="cross")
+# month × room 그리드로 0 채워서 추이 표시
+trend = pd.MultiIndex.from_product([all_months, rooms_all], names=["month", "room"]).to_frame(index=False)
 trend = trend.merge(monthly[["month", "room", "rate"]], on=["month", "room"], how="left")
 trend["rate"] = trend["rate"].fillna(0.0)
+
 trend = trend[trend["month"].isin(trend_months)].copy()
 trend["month_dt"] = pd.to_datetime(trend["month"] + "-01")
 
@@ -385,6 +393,7 @@ default_rooms = list(cur_table.head(min(5, len(cur_table)))["room"])
 sel_rooms = st.multiselect("추이를 볼 회의실 선택", options=rooms_all, default=default_rooms)
 
 trend_view = trend[trend["room"].isin(sel_rooms)].copy()
+
 fig2 = px.line(
     trend_view.sort_values(["room", "month_dt"]),
     x="month_dt",
@@ -393,9 +402,16 @@ fig2 = px.line(
     markers=True,
     labels={"month_dt": "월", "rate": "예약률(%)", "room": "회의실"},
 )
+
+# ✅ SyntaxError 방지: y축 최대값은 변수로 분리
+if len(trend_view) == 0:
+    y_max = 10
+else:
+    y_max = min(110, max(10, float(trend_view["rate"].max()) * 1.2))
+
 fig2.update_layout(
     xaxis=dict(tickformat="%Y-%m"),
-    yaxis=dict(range=[0, min(110, max(10, float(trend_view["rate"].max()) * 1.2) if len(trend_view) else 10))]),
+    yaxis=dict(range=[0, y_max]),
     margin=dict(l=10, r=10, t=10, b=10),
     height=420
 )
